@@ -436,7 +436,7 @@ async function removeUFWRule(oldIp, config) {
 
 
 async function setupWizard(isReset = false) {
-    // Handle configuration reset if requested
+    // Handle reset request if user wants to create new configuration
     if (isReset) {
         term.yellow('\n  This will override your existing configuration.\n');
         term.white('  Are you sure?\n');
@@ -445,7 +445,6 @@ async function setupWizard(isReset = false) {
         await deleteConfig();
     }
 
-    // Main setup loop
     while (true) {
         try {
             drawHeader('Setup Wizard');
@@ -458,84 +457,65 @@ async function setupWizard(isReset = false) {
                 'Help - Explain the differences'
             ]);
             
-            // Show help if requested
             if (nodeTypeChoice === 2) {
                 await showWelcomeScreen();
                 continue;
             }
 
             const isServer = nodeTypeChoice === 1;
-            
-            // Step 2: Server-specific requirements check
+            let sshPort = null;
+
+            // Step 2: Server-specific Requirements Check
             if (isServer) {
-                // Verify operating system
                 if (process.platform !== 'linux') {
                     term.red('\n  Error: Server node requires Linux (Ubuntu/Debian)\n');
                     await new Promise(resolve => setTimeout(resolve, 2000));
                     continue;
                 }
 
-                // Check system requirements
-                term.yellow('\n  Checking system requirements...\n');
-                
-                // SSH server check and configuration
-                term.white('  Checking SSH server...\n');
-                const sshConfigured = await checkAndConfigureSSH();
-                if (!sshConfigured) {
-                    term.red('  ✗ SSH server configuration failed\n');
-                    term.white('  Press any key to retry...');
-                    await term.inputField({ echo: false }).promise;
-                    continue;
-                }
-
-                // Detect SSH port
-                term.yellow('\n  Detecting SSH port configuration...');
-                let sshPort = await detectSSHPort();
-                
-                if (!sshPort) {
-                    term.white('\n  Could not automatically detect SSH port.\n');
-                    term.gray('  Common ports are:\n');
-                    term.gray('  - 22 (default SSH port)\n');
-                    term.gray('  - 2222, 20000, etc. (custom ports)\n\n');
+                // SSH Server Check and Port Detection
+                term.yellow('\n  Checking SSH server configuration...');
+                try {
+                    const sshConfig = await $`cat /etc/ssh/sshd_config`;
+                    const configContent = sshConfig.stdout.toString();
+                    const portMatch = configContent.match(/^Port\s+(\d+)/m);
                     
-                    // Port input loop
-                    while (true) {
-                        const portInput = await getInput('  Enter SSH port number: ');
-                        sshPort = parseInt(portInput);
-                        
-                        // Validate port number
-                        if (isNaN(sshPort) || sshPort < 1 || sshPort > 65535) {
-                            term.red('  Invalid port number. Please enter a number between 1 and 65535.\n');
-                            continue;
-                        }
-                        
-                        // Verify port is in use
-                        try {
-                            await $`netstat -tlpn | grep :${sshPort}`;
-                            break;
-                        } catch {
-                            term.yellow(`\n  Warning: No service detected on port ${sshPort}.\n`);
-                            term.white('  Continue anyway? (y/n): ');
-                            const confirm = await term.inputField().promise;
-                            if (confirm.toLowerCase() === 'y') break;
+                    if (portMatch) {
+                        sshPort = parseInt(portMatch[1]);
+                    } else {
+                        const netstat = await $`netstat -tlpn | grep sshd`;
+                        const netstatOutput = netstat.stdout.toString();
+                        const listeningMatch = netstatOutput.match(/:(\d+)\s/);
+                        if (listeningMatch) {
+                            sshPort = parseInt(listeningMatch[1]);
                         }
                     }
+                } catch {
+                    sshPort = 22; // Default SSH port if detection fails
                 }
 
-                term.green(`\n  ✓ Using SSH port: ${sshPort}\n`);
+                term.green(`\n  ✓ Detected SSH port: ${sshPort}\n`);
 
-                // UFW check and configuration
-                term.white('  Checking UFW...\n');
-                const ufwConfigured = await checkAndConfigureUFW();
-                if (!ufwConfigured) {
-                    term.red('  ✗ UFW configuration failed\n');
-                    term.white('  Press any key to retry...');
-                    await term.inputField({ echo: false }).promise;
-                    continue;
+                // UFW Check and Configuration
+                term.yellow('\n  Checking UFW status...');
+                try {
+                    await $`which ufw`;
+                    const ufwStatus = await $`sudo ufw status`;
+                    const statusOutput = ufwStatus.stdout.toString();
+                    
+                    if (!statusOutput.includes('Status: active')) {
+                        term.yellow('\n  UFW is not active. Enabling UFW...');
+                        await $`sudo ufw allow ${sshPort}`;
+                        await $`echo "y" | sudo ufw enable`;
+                    }
+                    
+                    term.green('\n  ✓ UFW is configured and running\n');
+                } catch (error) {
+                    throw new Error('UFW is required for server node operation');
                 }
             }
-            
-            // Step 3: GitHub token setup
+
+            // Step 3: GitHub Token Setup
             term.white('\n  GitHub Token Setup\n');
             term.gray('  - Generate at: https://github.com/settings/tokens\n');
             term.gray('  - Required scope: gist\n');
@@ -547,32 +527,34 @@ async function setupWizard(isReset = false) {
                 throw new Error('Invalid GitHub token');
             }
             term.green('\n  ✓ Token verified\n');
-            
-            // Step 4: Domain/Identifier setup
-            term.white('\n  Computer Identifier\n');
-            term.gray('  - Name to identify this machine\n');
-            term.gray('  - Example: home-laptop, office-desktop\n');
-            const domain = await getInput('  Enter identifier: ');
-            
-            // Step 5: GitHub gist setup
+
+            // Step 4: Configure Identifier (only for connector nodes)
+            let identifier = null;
+            if (!isServer) {
+                term.white('\n  Computer Identifier\n');
+                term.gray('  - Name to identify this machine\n');
+                term.gray('  - Example: home-laptop, office-desktop\n');
+                identifier = await getInput('  Enter identifier: ');
+            }
+
+            // Step 5: GitHub Gist Setup
             term.yellow('\n  Setting up secure gist...');
             const octokit = new Octokit({ auth: token });
             const { id: gistId, isNew } = await findOrCreateGist(octokit);
             term.green(`\n  ✓ ${isNew ? 'Created new' : 'Found existing'} gist\n`);
-            
-            // Create configuration object
+
+            // Create and save configuration
             const config = {
                 nodeType: isServer ? 'server' : 'connector',
                 githubToken: token,
                 gistId: gistId,
-                domain: domain,
-                sshPort: isServer ? sshPort : null,
+                identifier: identifier,  // Will be null for server
+                sshPort: sshPort,       // Will be null for connector
                 lastRun: new Date().toISOString()
             };
-            
-            // Save configuration
+
             await saveConfig(config);
-            
+
             // Show success message
             drawHeader('Setup Complete!');
             term.green(`
@@ -580,20 +562,19 @@ async function setupWizard(isReset = false) {
   
   Your ${config.nodeType} node will:
   ${config.nodeType === 'connector' ? `
-  - Check IP every ${UPDATE_INTERVAL / 60000} minutes
-  - Update the gist when IP changes
+  - Track IP changes for: ${identifier}
+  - Update the central gist every ${UPDATE_INTERVAL / 60000} minutes
   - Show real-time status updates` : `
-  - Check for IP updates every ${UPDATE_INTERVAL / 60000} minutes
-  - Manage UFW rules on port ${config.sshPort}
-  - Show firewall update status`}
+  - Monitor IP whitelist changes
+  - Manage UFW rules for port ${sshPort}
+  - Update firewall automatically`}
   
   Press any key to start...`);
-            
+
             await term.inputField({ echo: false }).promise;
             return config;
-            
+
         } catch (error) {
-            // Error handling
             term.red(`\n  Error: ${error.message}\n\n`);
             term.white('  What would you like to do?\n');
             const choice = await showMenu([
@@ -601,7 +582,7 @@ async function setupWizard(isReset = false) {
                 'Show help',
                 'Exit'
             ]);
-            
+
             switch (choice) {
                 case 0: continue;
                 case 1: 
